@@ -1,53 +1,73 @@
-// Keyboard and pointer input. Held keys give a steering direction; one-shot presses (start or
-// restart, pause) are queued as bit flags and taken once by the loop, so a press between two
-// frames is never lost and never counted twice.
+// Input: pointer hit-testing against the drawn widgets and keyboard shortcuts. Clicks are
+// one-shot intents carrying the logical position, so x/y = null means "not a positional click"
+// (keyboard). Each intent reads once via takeIntents(), so a press between two frames is never
+// lost and never counted twice. Handled keys call preventDefault to keep Space from scrolling.
 
-export const ACTION_CONFIRM = 1;
-export const ACTION_PAUSE = 2;
+import { INGREDIENT_ORDER } from './config.js';
 
-const LEFT = new Set(['ArrowLeft', 'KeyA']);
-const RIGHT = new Set(['ArrowRight', 'KeyD']);
-const CONFIRM = new Set(['Space', 'Enter']);
-const PAUSE = new Set(['KeyP', 'Escape']);
+/** A click's logical position, or null for keyboard intents. */
+export function intent(kind, x = null, y = null) {
+  return { kind, x, y };
+}
 
-export function createInput(target) {
-  let left = false;
-  let right = false;
-  let actions = 0;
+export const INTENT_SELECT = 'select';      // index into world.tickets, or -1 for none
+export const INTENT_STATION = 'station';    // prep station key
+export const INTENT_BIN = 'bin';            // ingredient key
+export const INTENT_SERVE = 'serve';
+export const INTENT_MUTE = 'mute';
+
+const DIGITS = { Digit1: 0, Digit2: 1, Digit3: 2, Digit4: 3, Digit5: 4, Digit6: 5, Numpad1: 0, Numpad2: 1, Numpad3: 2, Numpad4: 3, Numpad5: 4, Numpad6: 5 };
+const SERVE_KEYS = new Set(['Space', 'Enter']);
+const MUTE_KEYS = new Set(['KeyM']);
+
+export function createInput(target, logicalSize, handlers) {
+  const intents = [];
+  let muted = false;
+
+  function push(kind, x, y) {
+    intents.push(intent(kind, x, y));
+    if (intents.length > 16) intents.shift();
+  }
 
   window.addEventListener('keydown', (event) => {
-    if (LEFT.has(event.code)) left = true;
-    else if (RIGHT.has(event.code)) right = true;
-    else if (CONFIRM.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_CONFIRM;
-    } else if (PAUSE.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_PAUSE;
-    } else return;
-    event.preventDefault();
+    if (event.repeat) {
+      if (SERVE_KEYS.has(event.code) || MUTE_KEYS.has(event.code) || event.code in DIGITS) event.preventDefault();
+      return;
+    }
+    if (SERVE_KEYS.has(event.code)) {
+      event.preventDefault();
+      push(INTENT_SERVE);
+    } else if (MUTE_KEYS.has(event.code)) {
+      event.preventDefault();
+      muted = !muted;
+      push(INTENT_MUTE);
+    } else if (event.code in DIGITS) {
+      event.preventDefault();
+      const index = DIGITS[event.code];
+      const name = INGREDIENT_ORDER[index];
+      if (name) push(INTENT_BIN, null, null, { ingredient: name });
+    }
   });
-  window.addEventListener('keyup', (event) => {
-    if (LEFT.has(event.code)) left = false;
-    else if (RIGHT.has(event.code)) right = false;
-  });
-  // A key released while the tab is hidden never sends keyup: let go of everything on blur.
-  window.addEventListener('blur', () => {
-    left = false;
-    right = false;
-  });
-  target.addEventListener('pointerdown', () => {
-    actions |= ACTION_CONFIRM;
+  window.addEventListener('blur', () => { muted = false; });
+
+  // Coarse pointer first, then the exact widget, so a click lands on the topmost thing under it.
+  target.addEventListener('pointerdown', (event) => {
+    const rect = target.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const scale = logicalSize.width / rect.width;
+    const x = (event.clientX - rect.left) * scale;
+    const y = (event.clientY - rect.top) * scale;
+    push(INTENT_SELECT, x, y, handlers ? handlers(x, y) : -1);
   });
 
   return {
-    /** -1 for left, 1 for right, 0 for neither or both. */
-    direction() {
-      return (right ? 1 : 0) - (left ? 1 : 0);
-    },
-    /** The one-shot presses since the last call, as ACTION_* flags. */
-    takeActions() {
-      const taken = actions;
-      actions = 0;
+    /** Called each frame by the loop; returns true when anything changed. */
+    takeIntents() {
+      if (!intents.length) return false;
+      const taken = intents;
+      intents.length = 0;
       return taken;
     },
+    get muted() { return muted; },
   };
 }

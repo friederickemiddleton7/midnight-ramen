@@ -1,28 +1,90 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
+// Boot and the one loop for Midnight Ramen: a window-sized canvas carries the fixed 1280x720
+// logical field, letterboxed and scaled through ctx.setTransform (pointer coordinates are mapped
+// back in for hit tests). The world advances in fixed 1/60 s steps — several in a slow frame, none
+// in a fast one. Input is wired directly here rather than via input.js, whose click mapping assumes
+// the flat field and whose key intents carry no ingredient.
 //
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
+// ?seed=N fixes the order pattern (the default is fixed too). ?shot=<name>&seed=N stages a
+// deterministic scene instead of booting the loop: one frame is painted for capture, then stop.
+import {
+  BEST_KEY, BIN_RECTS, FIELD, INGREDIENT_ORDER, PALETTE, SERVE, STEP, STATION_ORDER,
+  STATION_RECTS, TICKET_SLOTS,
+} from './config.js';
+import {
+  createWorld, EVENT_ADDED, EVENT_LEFT_ANGRY, EVENT_ORDER_IN, EVENT_PREP_DONE, EVENT_SERVED,
+  EVENT_SHIFT_OVER, EVENT_WRONG, SCREEN_PLAY,
+} from './world.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
+import { render } from './render.js';
+import { stageShot } from './scenes.js';
+import { isMuted, setMuted, sfx, unlockAudio } from './audio.js';
 
 /** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
 const MAX_FRAME = 0.25;
+/** The seed when the URL names none: fixed, so the default shift repeats exactly. */
+const DEFAULT_SEED = 1;
+/** The sound each prep station makes while it works. */
+const STATION_SFX = { board: 'chop', pot: 'bubble', grill: 'sizzle' };
+/** Input reaches the world through its methods, so the fixed steps carry no intents of their own. */
+const NO_INTENTS = { serve: false, ingredient: null };
 
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const seed = Number.isInteger(seedParam) ? seedParam : DEFAULT_SEED;
 
-const canvas = document.getElementById('game');
+// The canvas: the page's #game when the document has one, else a new one created and appended.
+const canvas = document.getElementById('game') ?? (() => {
+  const made = document.createElement('canvas');
+  made.id = 'game';
+  document.body.appendChild(made);
+  return made;
+})();
+const ctx = canvas.getContext('2d');
 const status = document.getElementById('status');
+
 const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+let best = readBest();
+let accumulator = 0;
+let viewScale = 1;
+let viewOx = 0;
+let viewOy = 0;
+
+/** Fit the canvas to the window and recompute the letterbox transform's scale and offset. */
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const cssWidth = Math.max(1, window.innerWidth);
+  const cssHeight = Math.max(1, window.innerHeight);
+  canvas.width = Math.round(cssWidth * dpr);
+  canvas.height = Math.round(cssHeight * dpr);
+  canvas.style.width = `${cssWidth}px`;
+  canvas.style.height = `${cssHeight}px`;
+  viewScale = Math.min(canvas.width / FIELD.width, canvas.height / FIELD.height);
+  viewOx = (canvas.width - FIELD.width * viewScale) / 2;
+  viewOy = (canvas.height - FIELD.height * viewScale) / 2;
+}
+
+/** A click's page coordinates to the logical field's 0..1280 x 0..720, letterbox undone. */
+function toLogical(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const scale = Math.min(rect.width / FIELD.width, rect.height / FIELD.height);
+  const ox = (rect.width - FIELD.width * scale) / 2;
+  const oy = (rect.height - FIELD.height * scale) / 2;
+  return { x: (clientX - rect.left - ox) / scale, y: (clientY - rect.top - oy) / scale };
+}
+
+const hits = (x, y, rect) => x >= rect.x && x < rect.x + rect.w && y >= rect.y && y < rect.y + rect.h;
+
+/** Paint one frame: fill the letterbox bars, then the field through the letterbox transform. */
+function draw(target = world) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = PALETTE.nightDeep;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(viewScale, 0, 0, viewScale, viewOx, viewOy);
+  render(ctx, target);
+}
+
+// ---- best score (this browser only; storage may be off) ---------------------------------------
 
 function readBest() {
   try {
@@ -36,99 +98,115 @@ function saveBest(value) {
   try {
     window.localStorage.setItem(BEST_KEY, String(value));
   } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
+    // Private-mode and friends: the best score then lasts this visit only.
   }
 }
 
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
+/** Screen readers (and anyone watching the page's text) hear the screen changes. */
+function announce(message) {
+  if (status) status.textContent = message;
 }
 
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
+// ---- screen flow ------------------------------------------------------------------------------
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
+function startShift() {
+  world.reset();
+  world.screen = SCREEN_PLAY;
+  accumulator = 0;
+  unlockAudio();
+  announce('Shift started. Read the tickets and layer each bowl in order.');
+}
+
+function endShift() {
+  if (world.state.score > best) {
+    best = world.state.score;
+    saveBest(best);
   }
+  announce(`Shift over. Score ${world.state.score}. Best ${best}.`);
+}
 
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
+// ---- input, straight to the world's methods ---------------------------------------------------
 
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
+function addIngredient(key) {
+  const events = world.tryAdd(key);
+  if (events & (EVENT_ADDED | EVENT_WRONG)) sfx(events & EVENT_WRONG ? 'error' : 'pop');
+}
 
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
+function serveBowl() {
+  if (world.serve() & EVENT_SERVED) sfx('bell');
+}
 
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
+/** A pointer click in logical coordinates: tickets, then stations, pantry bins, the serve pass. */
+function handleClick(x, y) {
+  if (world.screen !== SCREEN_PLAY) return startShift(); // title/over: a click starts or restarts
+  for (let i = 0; i < TICKET_SLOTS.length; i += 1) {
+    if (hits(x, y, TICKET_SLOTS[i])) {
+      if (world.selectTicket(i)) sfx('order');
       return;
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
   }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
-      }
-    } else {
-      accumulator = 0;
+  for (const key of STATION_ORDER) {
+    if (hits(x, y, STATION_RECTS[key])) {
+      if (world.startPrep(key)) sfx(STATION_SFX[key]);
+      return;
     }
-    renderer.draw(world.state, screen, best);
   }
-
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('Block Dodger. Press Space or click to start.');
-  requestAnimationFrame(frame);
+  for (const bin of BIN_RECTS) {
+    if (hits(x, y, bin)) return addIngredient(bin.key);
+  }
+  if (hits(x, y, SERVE)) serveBowl();
 }
 
-if (shot) runShot(shot);
-else runGame();
+canvas.addEventListener('pointerdown', (event) => {
+  unlockAudio();
+  const point = toLogical(event.clientX, event.clientY);
+  handleClick(point.x, point.y);
+});
+
+window.addEventListener('keydown', (event) => {
+  if (event.repeat) return;
+  if (event.code === 'Space' || event.code === 'Enter') {
+    event.preventDefault();
+    unlockAudio();
+    if (world.screen === SCREEN_PLAY) serveBowl();
+    else startShift();
+  } else if (event.code === 'KeyM') {
+    event.preventDefault();
+    setMuted(!isMuted());
+  } else if (/^(?:Digit|Numpad)[1-6]$/.test(event.code)) {
+    event.preventDefault();
+    addIngredient(INGREDIENT_ORDER[Number(event.code.slice(-1)) - 1]);
+  }
+});
+
+// ---- the fixed-step loop ----------------------------------------------------------------------
+
+let last = performance.now();
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  accumulator += Math.min((now - last) / 1000, MAX_FRAME);
+  last = now;
+  while (accumulator >= STEP && world.screen === SCREEN_PLAY) {
+    accumulator -= STEP;
+    const events = world.step(STEP, NO_INTENTS);
+    if (events & EVENT_ORDER_IN) sfx('order');
+    if (events & EVENT_PREP_DONE) sfx('prep');
+    if (events & (EVENT_LEFT_ANGRY | EVENT_SHIFT_OVER)) sfx(events & EVENT_SHIFT_OVER ? 'over' : 'angry');
+    if (events & EVENT_SHIFT_OVER) endShift();
+  }
+  if (world.screen !== SCREEN_PLAY) accumulator = 0;
+  draw();
+}
+
+window.addEventListener('resize', resize);
+resize();
+
+if (shot) {
+  // A capture run: stage the named scene on a fresh seeded world, paint the one frame, stop.
+  draw(stageShot(shot, seed));
+  window.__shotReady = true;
+} else {
+  announce('Midnight Ramen. Click or press Space to start the shift.');
+  requestAnimationFrame(frame);
+}
